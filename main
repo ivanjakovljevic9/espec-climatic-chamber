@@ -1,0 +1,203 @@
+import requests
+import re
+import time
+
+BASE_URL = ""
+USERNAME = ""
+PASSWORD = ""
+
+
+# ---------- SAFE REQUEST ----------
+def safe_request(method, url, session, data=None):
+    try:
+        if method == "GET":
+            return session.get(url, timeout=3)
+        else:
+            return session.post(url, data=data, timeout=3)
+    except Exception:
+        print("connection dropped (ignored)")
+        return None
+
+
+# ---------- LOGIN ----------
+def login(session):
+    safe_request("GET", BASE_URL + "/login.php", session)
+
+    r = safe_request("POST", BASE_URL + "/login.php", session, {
+        "username": USERNAME,
+        "password": PASSWORD,
+        "login_button": "Accept the license agreement and login."
+    })
+
+    if not r or "Login" in r.text:
+        print("Login failed")
+        return False
+
+    print("Logged in")
+    return True
+
+
+# ---------- AJAX SYNC (IMPORTANT!) ----------
+def sync(session):
+    safe_request("POST", BASE_URL + "/wo01getdata.php", session)
+
+
+# ---------- PARSE ----------
+def extract(html, element_id):
+    if not html:
+        return None
+
+    m = re.search(rf'id="{element_id}">([^<]+)<', html)
+    if not m:
+        return None
+
+    v = m.group(1).replace("℃", "").replace("%rh", "").strip()
+
+    if v in ["----", "OFF"]:
+        return None
+
+    try:
+        return float(v)
+    except:
+        return None
+
+
+# ---------- GET DATA ----------
+def get_data(session):
+    r = safe_request("GET", BASE_URL + "/status.php", session)
+    if not r:
+        return (None, None)
+
+    return (
+        extract(r.text, "monitor-temp-pv-value"),
+        extract(r.text, "monitor-hum-pv-value")
+    )
+
+
+# ---------- SET CONST-1 ----------
+def set_const1(session, temp, hum=None):
+    safe_request("GET", BASE_URL + "/wc01.php", session)
+
+    payload = {
+        "const_name_sel": "0",
+        "const_name": "CONSTANT-01",
+
+        "sv_end1": str(temp),
+
+        "sv_end2disp": str(hum) if hum else "0",
+        "sv_end2": str(hum) if hum else "0",
+        "loop_start": "1" if hum else "0",
+
+        "limit_low0": "-80",
+        "limit_high0": "185",
+        "limit_low1": "0",
+        "limit_high1": "100",
+
+        "limit_dev_high0": "10",
+
+        "ref_mac": "9",
+        "output_setting": "1",
+        "ext_para0": "4",
+
+        "pdt_ctrl_enb0": "0",
+        "pdt_ctrl_dev_max": "10",
+        "pdt_ctrl_dev_min": "-10",
+
+        "exeKbn": "",
+        "commit": "Set"
+    }
+
+    safe_request("POST", BASE_URL + "/wc01.php", session, payload)
+
+    print(f"Updated CONST-1 → Temp={temp}, Hum={'OFF' if not hum else hum}")
+
+
+# ---------- RUN CONSTANT-1 (FROM SECOND CODE) ----------
+def run_constant1(session):
+    safe_request("GET", BASE_URL + "/wo01.php", session)
+
+    sync(session)
+    time.sleep(0.5)
+
+    safe_request("POST", BASE_URL + "/wo01.php", session, {
+        "target": "cnst1",
+        "cnst1": "Const  1",
+        "btn_session_clear": "",
+        "pgm_no": "18",
+        "step_no": "1"
+    })
+
+    print("Start command sent")
+
+    # trigger execution
+    for _ in range(5):
+        time.sleep(0.5)
+        sync(session)
+
+    r = safe_request("GET", BASE_URL + "/status.php", session)
+    status = r.text if r else ""
+
+    if "CONSTANT" in status:
+        print("SUCCESS: Constant-1 running")
+    else:
+        print("Failed to start")
+
+
+# ---------- STOP ----------
+def stop_chamber(session):
+    safe_request("GET", BASE_URL + "/wo01.php", session)
+
+    sync(session)
+    time.sleep(0.5)
+
+    safe_request("POST", BASE_URL + "/wo01.php", session, {
+        "target": "shutdown",
+        "shutdown": "Stop",
+        "btn_session_clear": "",
+        "pgm_no": "18",
+        "step_no": "1"
+    })
+
+    print("Stop command sent")
+
+    for _ in range(5):
+        time.sleep(0.5)
+        sync(session)
+
+    r = safe_request("GET", BASE_URL + "/status.php", session)
+    status = r.text if r else ""
+
+    if "STOP" in status:
+        print("SUCCESS: Chamber stopped")
+    else:
+        print("Failed to stop")
+
+
+# ---------- MAIN RUN ----------
+def run(session, temp, hum=None):
+
+    if not login(session):
+        return
+
+    print("Initial:", get_data(session))
+
+    # STEP 1: Configure Constant first
+    set_const1(session, temp, hum)
+
+    time.sleep(2)
+
+    # STEP 2: Start Constant using improved function
+    run_constant1(session)
+
+    time.sleep(5)
+
+    print("After:", get_data(session))
+
+
+# ---------- MAIN ----------
+if __name__ == "__main__":
+    session = requests.Session()
+    run(session, 30, 80)
+    # run(40, 60)
+    time.sleep(30)  
+    stop_chamber(session=session)  # optional
